@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""
+tmdb_tui.py — an interactive terminal UI for browsing TMDB (The Movie Database),
+in the spirit of btop/htop/claude-code's TUI: live panels, keyboard-driven.
+"""
+import os
+# Must be set before curses.initscr() runs — this is what controls how long
+# ncurses waits after Esc to see if more bytes (an arrow key / alt sequence)
+# are coming. Default is ~1000ms, which is the perceptible "lag" on Esc.
+os.environ.setdefault("ESCDELAY", "25")
+import curses
+import locale
+import textwrap
+import requests
+import subprocess
+# from tmdb_config import TMDB_API_TOKEN, TMDB_BASE_URL
+
+TMDB_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1YjFjM2M4ZDg3MTU1MWU2NDg0N2FlNGQ5NTRlMDgwNyIsIm5iZiI6MTc4NjU2MTM5Ni43OTMsInN1YiI6IjZhN2NjMzc0ZmI3YTFjMjkwMTQ0ZmRlYSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.heOiSMRVHPZiCerBZK-91bqtqclEDjCbnzbYpFQo56w"
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+
+HEADERS = {
+    "Authorization": f"Bearer {TMDB_API_TOKEN}",
+    "Accept": "application/json",
+}
+
+MODE_NORMAL = "normal"
+MODE_SEARCH = "search"
+MODE_YEAR = "year"
+MODE_ID = "id"
+MODE_SEASON = "season"
+MODE_EPISODE = "episode"
+
+SCREEN_RESULTS = "results"
+SCREEN_DETAIL = "detail"
+SCREEN_EPISODES = "episodes"
+SCREEN_EPISODE_DETAIL = "episode_detail"
+
+# Below this size we don't even try to lay out the normal screens — packing
+# everything in just causes overlapping text. We show a "resize" notice instead.
+MIN_WIDTH = 50
+MIN_HEIGHT = 10
+
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+class TMDBClient:
+    """Thin wrapper around the TMDB v3 API. Every method returns (data, error)
+    — error is None on success, or a short human-readable string on failure.
+    Nothing here ever raises; the UI layer never needs to catch anything."""
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+
+    def _get_json(self, url, params=None):
+        try:
+            resp = self.session.get(url, params=params, timeout=10)
+        except requests.exceptions.Timeout:
+            return None, "Request timed out."
+        except requests.exceptions.RequestException as e:
+            return None, f"Network error: {e}"
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        try:
+            return resp.json(), None
+        except ValueError:
+            return None, "Malformed JSON response."
+
+    def search_multi(self, title: str, year: str = ""):
+        """Searches movies AND tv shows in one call via TMDB's multi-search.
+        Filters out 'person' results and keeps each item's media_type."""
+        data, err = self._get_json(f"{TMDB_BASE_URL}/search/multi", params={"query": title})
+        if err:
+            return [], err
+        results = [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")]
+        if year:
+            def year_of(r):
+                date = r.get("release_date") or r.get("first_air_date") or ""
+                return date[:4]
+            results = [r for r in results if year_of(r) == year]
+        return results, None
+
+    def get_by_id(self, media_type: str, tmdb_id):
+        endpoint = "movie" if media_type == "movie" else "tv"
+        return self._get_json(f"{TMDB_BASE_URL}/{endpoint}/{tmdb_id}")
+
+    def get_season(self, tv_id, season_number):
+        return self._get_json(f"{TMDB_BASE_URL}/tv/{tv_id}/season/{season_number}")
+
+
+def safe_addstr(win, y, x, text, attr=0):
+    """Never lets a curses write outside the window crash the app —
+    truncates to the available width and swallows the edge-case curses.error
+    that happens when writing to the exact bottom-right cell."""
+    h, w = win.getmaxyx()
+    if 0 <= y < h and 0 <= x < w:
+        try:
+            win.addstr(y, x, text[: max(0, w - x - 1)], attr)
+        except curses.error:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+class App:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.client = TMDBClient()
+        self.id_lookup_type = "movie"  # only for the direct 'i' lookup
+
+        # search / lookup fields
+        self.title_query = ""
+        self.year_query = ""
+        self.id_query = ""
+
+        # navigation state
+        self.screen = SCREEN_RESULTS
+        self.mode = MODE_NORMAL
+        self.input_buffer = ""
+
+        # results list
+        self.results = []
+        self.selected = 0
+        self.results_offset = 0
+
+        # movie or tv show detail (dict; media_type is stamped onto it)
+        self.detail = None
+
+        # season selection (index into detail["seasons"]) — lives on the tv detail screen
+        self.season_selected = 0
+        self.season_offset = 0
+
+        # currently loaded season + its episodes
+        self.season_data = None
+        self.episodes = []
+        self.episode_selected = 0
+        self.episode_offset = 0
+        self.episode_detail = None
+
+        self.status = "Ready. / to search, i for ID lookup, Tab sets ID type, q to quit."
+        self.error = None
+
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)     # header
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # highlight / accents
+        curses.init_pair(3, curses.COLOR_GREEN, -1)    # status
+        curses.init_pair(4, curses.COLOR_RED, -1)      # error
+        curses.init_pair(5, -1, curses.COLOR_CYAN)     # selected row
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # media-type tag
+
+        stdscr.nodelay(False)
+        stdscr.keypad(True)
+
+    # ---------- small pure helpers ----------
+    @staticmethod
+    def adjust_scroll(selected, offset, height):
+        if height <= 0:
+            return 0
+        if selected < offset:
+            offset = selected
+        elif selected >= offset + height:
+            offset = selected - height + 1
+        return max(0, offset)
+
+    @staticmethod
+    def validate_season_number(value: str):
+        if not value.isdigit():
+            return None, f"'{value}' is not a valid season number."
+        return int(value), None
+
+    @staticmethod
+    def validate_episode_number(value: str):
+        if not value.isdigit():
+            return None, f"'{value}' is not a valid episode number."
+        num = int(value)
+        if num <= 0:
+            return None, "Episode number must be a positive integer."
+        return num, None
+
+    def get_tv_seasons(self):
+        if not self.detail or self.detail.get("media_type") != "tv":
+            return []
+        seasons = self.detail.get("seasons", [])
+        return sorted(seasons, key=lambda s: s.get("season_number", 0))
+
+    def find_episode_by_number(self, num: int):
+        for idx, ep in enumerate(self.episodes):
+            if ep.get("episode_number") == num:
+                return idx
+        return None
+
+    # ---------- data actions ----------
+    def do_search(self):
+        if not self.title_query:
+            self.status = "Type a title first (/)."
+            return
+        self.status = f"Searching movies + TV for '{self.title_query}'..."
+        self.draw()
+        results, err = self.client.search_multi(self.title_query, self.year_query)
+        self.error = err
+        if err:
+            self.status = "Search failed."
+            return
+        self.results = results
+        self.selected = 0
+        self.results_offset = 0
+        self.detail = None
+        self.screen = SCREEN_RESULTS
+        self.status = f"{len(results)} result(s) for '{self.title_query}'" + (
+            f" ({self.year_query})" if self.year_query else ""
+        )
+
+    def do_id_lookup(self):
+        if not self.id_query:
+            self.status = "Type an ID first (i)."
+            return
+        self.status = f"Fetching {self.id_lookup_type} id={self.id_query}..."
+        self.draw()
+        data, err = self.client.get_by_id(self.id_lookup_type, self.id_query)
+        self.error = err
+        if err:
+            self.status = "Lookup failed."
+            return
+        data["media_type"] = self.id_lookup_type
+        self.results = []
+        self.selected = 0
+        self._enter_detail(data)
+        self.status = f"Loaded id={self.id_query}"
+
+    def open_selected_detail(self):
+        if not self.results:
+            return
+        item = self.results[self.selected]
+        media_type = item.get("media_type", "movie")
+        self.status = f"Loading details for id={item.get('id')}..."
+        self.draw()
+        data, err = self.client.get_by_id(media_type, item.get("id"))
+        self.error = err
+        if err:
+            self.status = f"Failed to load details: {err}"
+            return
+        data["media_type"] = media_type
+        self._enter_detail(data)
+        self.status = "Details loaded."
+
+    def _enter_detail(self, data):
+        self.detail = data
+        self.season_selected = 0
+        self.season_offset = 0
+        self.season_data = None
+        self.episodes = []
+        self.episode_detail = None
+        self.screen = SCREEN_DETAIL
+
+    def load_season(self, season_number_str: str):
+        if self.detail is None or self.detail.get("media_type") != "tv":
+            return
+        num, err = self.validate_season_number(season_number_str)
+        if err:
+            self.status = err
+            return
+        seasons = self.get_tv_seasons()
+        valid_numbers = [s.get("season_number") for s in seasons]
+        if num not in valid_numbers:
+            self.status = f"Season {num} does not exist for this show."
+            return
+        tv_id = self.detail.get("id")
+        self.status = f"Loading season {num}..."
+        self.draw()
+        data, err = self.client.get_season(tv_id, num)
+        self.error = err
+        if err:
+            self.status = f"Failed to load Season {num}: {err}"
+            return
+        self.season_data = data
+        self.episodes = data.get("episodes", [])
+        self.episode_selected = 0
+        self.episode_offset = 0
+        self.episode_detail = None
+        self.screen = SCREEN_EPISODES
+        for idx, s in enumerate(seasons):
+            if s.get("season_number") == num:
+                self.season_selected = idx
+                break
+        self.status = f"Season {num}: {len(self.episodes)} episode(s)."
+
+    def select_season(self, season: dict):
+        self.load_season(str(season.get("season_number", "")))
+
+    def open_episode_by_index(self, idx: int):
+        if not (0 <= idx < len(self.episodes)):
+            self.status = "No such episode in this season."
+            return
+        self.episode_selected = idx
+        self.episode_detail = self.episodes[idx]
+        self.screen = SCREEN_EPISODE_DETAIL
+        self.status = "Esc to go back, p to play."
+
+    def open_episode_by_number(self, value: str):
+        num, err = self.validate_episode_number(value)
+        if err:
+            self.status = err
+            return
+        idx = self.find_episode_by_number(num)
+        if idx is None:
+            season_num = self.season_data.get("season_number", "?") if self.season_data else "?"
+            self.status = f"Episode {num} not found in Season {season_num}."
+            return
+        self.open_episode_by_index(idx)
+
+    def play_stream(self):
+        """Fetches stream URLs from APIs and tries them sequentially with mpv."""
+        if not self.detail:
+            self.status = "No media selected."
+            return
+        
+        media_type = self.detail.get("media_type", "movie")
+        tmdb_id = str(self.detail.get("id", ""))
+        title = self.detail.get("title") or self.detail.get("name", "")
+        year = (self.detail.get("release_date") or self.detail.get("first_air_date", ""))[:4]
+        
+        season_num = "1"
+        episode_num = "1"
+        
+        if media_type == "tv":
+            if not self.season_data or not self.episode_detail:
+                self.status = "Please select a season and episode first."
+                return
+            season_num = str(self.season_data.get("season_number", "1"))
+            episode_num = str(self.episode_detail.get("episode_number", "1"))
+
+        self.status = "Fetching stream URLs..."
+        self.draw()
+        self.stdscr.refresh()
+        
+        # Temporarily release the terminal so mpv can take full control
+        curses.endwin()
+        
+        # List of tuples: (url, headers_dict)
+        candidate_streams = []
+        
+        # =========================================================================
+        # API 1: Primary (vidlove)
+        # =========================================================================
+        try:
+            endpoint = "tv" if media_type == "tv" else "movie"
+            url1 = f"https://api.vidlove.cc/{endpoint}"
+
+            headers1 = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+            }
+
+            sources = [
+                "megaknight",
+                "vidapi",
+                "cinefreak",
+                "moviebox2"
+            ]
+
+            response_data = None
+            successful_source = None
+
+            for source in sources:
+                params1 = {
+                    "id": tmdb_id,
+                    "mode": "json",
+                    "sources": source,
+                    "hevc": 1
+                }
+
+                # TV needs season/episode
+                if media_type == "tv":
+                    params1["season"] = season_num
+                    params1["episode"] = episode_num
+
+                try:
+                    r = requests.get(
+                        url1,
+                        headers=headers1,
+                        params=params1,
+                        timeout=15
+                    )
+
+                    r.raise_for_status()
+
+                    data = r.json()
+
+                    # Check that the response actually contains a stream
+                    source_data = data.get("source")
+
+                    if not source_data or not isinstance(source_data, dict):
+                        print(f"Source {source} returned no stream")
+                        continue
+
+                    stream_url = source_data.get("url")
+
+                    if not stream_url:
+                        print(f"Source {source} returned no URL")
+                        continue
+
+                    # Success
+                    response_data = data
+                    successful_source = source
+
+                    print(f"Using source: {source}")
+
+                    stream_headers = source_data.get(
+                        "headers",
+                        {
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                            )
+                        }
+                    )
+
+                    candidate_streams.append(
+                        (stream_url, stream_headers)
+                    )
+
+                    break
+
+                except (requests.RequestException, ValueError) as e:
+                    print(f"Source {source} failed: {e}")
+                    continue
+
+            # All sources failed
+            if response_data is None:
+                raise Exception("All Vidlove sources failed")
+
+        except Exception as e:
+            print(f"Primary API failed: {e}")
+
+        # =========================================================================
+        # API 2: Fallback
+        # =========================================================================
+        if not candidate_streams:
+            try:
+                url2 = "https://api.peestream.in/api/search"
+                params2 = {"q": tmdb_id, "type": media_type}
+                if media_type == "tv":
+                    params2["season"] = season_num
+                    params2["episode"] = episode_num
+                    
+                response = requests.get(url2, params=params2, timeout=15)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Extract all stream URLs and their specific headers
+                for result in data.get("results", []):
+                    for stream in result.get("streams", []):
+                        stream_url = stream.get("url")
+                        if stream_url:
+                            stream_headers = stream.get("headers", {})
+                            candidate_streams.append((stream_url, stream_headers))
+            except Exception as e:
+                print(f"Fallback API failed: {e}")
+
+        # =========================================================================
+        # Play the streams sequentially until one succeeds
+        # =========================================================================
+        if not candidate_streams:
+            self.status = "No streams found from any API."
+        else:
+            success = False
+            for i, (stream_url, stream_headers) in enumerate(candidate_streams):
+                mpv_cmd = ["mpv"]
+                
+                # mpv STRICTLY requires the '=' syntax for options with parameters
+                ua = stream_headers.get("User-Agent") or stream_headers.get("user-agent")
+                if ua:
+                    mpv_cmd.append(f"--user-agent={ua}")
+                
+                for k, v in stream_headers.items():
+                    if k.lower() != "user-agent":
+                        # Properly quote header fields for mpv
+                        mpv_cmd.append(f'--http-header-fields="{k}: {v}"')
+                        
+                mpv_cmd.append(stream_url)
+                
+                try:
+                    result = subprocess.run(mpv_cmd)
+                    if result.returncode == 0:
+                        success = True
+                        break  # Stream played successfully (or closed normally), stop trying others
+                    else:
+                        print(f"Stream {i+1} failed (code {result.returncode}). Trying next...")
+                except FileNotFoundError:
+                    self.status = "Error: 'mpv' executable not found."
+                    success = True  # Break out to avoid looping
+                    break
+                except Exception as e:
+                    print(f"Playback error: {e}")
+            
+            if success:
+                self.status = "Playback finished."
+            else:
+                self.status = "All streams failed to play."
+                
+        # Restore curses screen properly
+        curses.reset_prog_mode()
+        curses.doupdate()
+        self.stdscr.refresh()
+    
+    # ---------- drawing ----------
+    def draw(self):
+        stdscr = self.stdscr
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        if h < MIN_HEIGHT or w < MIN_WIDTH:
+            self.draw_too_small(h, w)
+            stdscr.refresh()
+            return
+        
+        header = f" STUB  — search: movies + tv   |   id-lookup type: {self.id_lookup_type.upper()} (Tab) "
+        safe_addstr(stdscr, 0, 0, header.ljust(w), curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE)
+        bar = f" title: {self.title_query or '-'}    year: {self.year_query or '-'}    id: {self.id_query or '-'} "
+        safe_addstr(stdscr, 1, 0, bar.ljust(w), curses.color_pair(2))
+        
+        list_top = 3
+        list_bottom = h - 3
+        list_height = max(0, list_bottom - list_top)
+        
+        if self.screen == SCREEN_RESULTS:
+            self.draw_results(list_top, list_height, w)
+        elif self.screen == SCREEN_DETAIL:
+            self.draw_detail(list_top, list_bottom, list_height, w)
+        elif self.screen == SCREEN_EPISODES:
+            self.draw_episode_list(list_top, list_height, w)
+        elif self.screen == SCREEN_EPISODE_DETAIL:
+            self.draw_episode_detail(list_top, list_bottom, w)
+            
+        if self.mode != MODE_NORMAL:
+            prompt = {
+                MODE_SEARCH: "Search title> ",
+                MODE_YEAR: "Year> ",
+                MODE_ID: "TMDB ID> ",
+                MODE_SEASON: "Season number (0 = Specials)> ",
+                MODE_EPISODE: "Episode number> ",
+            }[self.mode]
+            safe_addstr(stdscr, h - 2, 0, (prompt + self.input_buffer).ljust(w), curses.A_BOLD)
+        else:
+            safe_addstr(stdscr, h - 2, 0, self.help_text().ljust(w), curses.color_pair(2) | curses.A_DIM)
+            
+        status_line = self.error if self.error else self.status
+        color = curses.color_pair(4) if self.error else curses.color_pair(3)
+        safe_addstr(stdscr, h - 1, 0, status_line.ljust(w), color)
+        stdscr.refresh()
+
+    def draw_too_small(self, h, w):
+        stdscr = self.stdscr
+        lines = [
+            "Terminal too small",
+            f"Current: {w}x{h}",
+            f"Need at least: {MIN_WIDTH}x{MIN_HEIGHT}",
+            "Resize the window or zoom out.",
+        ]
+        start_row = max(0, (h - len(lines)) // 2)
+        for i, line in enumerate(lines):
+            row = start_row + i
+            if row >= h:
+                break
+            col = max(0, (w - len(line)) // 2)
+            safe_addstr(stdscr, row, col, line, curses.color_pair(4) | curses.A_BOLD)
+
+    def help_text(self):
+        if self.screen == SCREEN_RESULTS:
+            return " / Search   y Year   i ID lookup   Tab Movie/TV ID type   j/k Move   Enter Open   q Quit"
+        if self.screen == SCREEN_DETAIL:
+            if self.detail and self.detail.get("media_type") == "tv":
+                return " p Play   j/k Select season   Enter Open season   s Type season #   Esc Back"
+            return " p Play (movie)   Esc Back"
+        if self.screen == SCREEN_EPISODES:
+            return " p Play   j/k Select episode   Enter Open   e Jump to episode #   Esc Back"
+        if self.screen == SCREEN_EPISODE_DETAIL:
+            return " p Play   Esc Back"
+        return ""
+
+    @staticmethod
+    def _media_tag(mtype):
+        return "[TV]  " if mtype == "tv" else "[MOVIE]"
+
+    def draw_results(self, list_top, list_height, w):
+        stdscr = self.stdscr
+        safe_addstr(stdscr, list_top - 1, 0, "Results:".ljust(w), curses.A_UNDERLINE)
+        if not self.results:
+            safe_addstr(stdscr, list_top, 2, "(no results yet)")
+            return
+        self.results_offset = self.adjust_scroll(self.selected, self.results_offset, list_height)
+        visible = self.results[self.results_offset: self.results_offset + list_height]
+        for row, item in enumerate(visible):
+            i = row + self.results_offset
+            name = item.get("title") or item.get("name") or "?"
+            date = item.get("release_date") or item.get("first_air_date") or "----"
+            rating = item.get("vote_average") or 0
+            mtype = item.get("media_type", "?")
+            tag = self._media_tag(mtype)
+            line = f"{name[:42]:<42} {date[:4]:>6}  \u2605{rating:.1f}  {tag} id={item.get('id')}"
+            attr = curses.color_pair(5) if i == self.selected else 0
+            safe_addstr(stdscr, list_top + row, 2, line, attr)
+        if len(self.results) > list_height:
+            safe_addstr(stdscr, list_top - 1, w - 14, f"[{self.selected + 1}/{len(self.results)}]")
+
+    def draw_detail(self, top, bottom, list_height, w):
+        stdscr = self.stdscr
+        d = self.detail
+        name = d.get("title") or d.get("name") or "?"
+        date = d.get("release_date") or d.get("first_air_date") or "?"
+        rating = d.get("vote_average") or 0
+        genres = ", ".join(g["name"] for g in d.get("genres", []))
+        overview = d.get("overview") or "(no overview)"
+        mtype = d.get("media_type", "?")
+        tmdb_id = d.get("id", "?")
+        
+        row = top
+        if row < bottom:
+            safe_addstr(stdscr, row, 2, f"{name}  ({date[:4] if date else '?'})  {self._media_tag(mtype)} id={tmdb_id}", curses.A_BOLD)
+            row += 1
+        if row < bottom:
+            safe_addstr(stdscr, row, 2, f"Rating: {rating:.1f}   Genres: {genres}")
+            row += 2
+            
+        if mtype == "tv":
+            seasons = self.get_tv_seasons()
+            if row < bottom:
+                safe_addstr(stdscr, row, 2, f"Seasons ({len(seasons)}):", curses.A_UNDERLINE)
+                row += 1
+            seasons_top = row
+            seasons_height = max(0, bottom - seasons_top)
+            if not seasons:
+                if seasons_top < bottom:
+                    safe_addstr(stdscr, seasons_top, 4, "(no season data available)")
+                return
+            self.season_offset = self.adjust_scroll(self.season_selected, self.season_offset, seasons_height)
+            visible = seasons[self.season_offset: self.season_offset + seasons_height]
+            for i, season in enumerate(visible):
+                idx = i + self.season_offset
+                num = season.get("season_number", "?")
+                sname = season.get("name") or "?"
+                ep_count = season.get("episode_count", 0)
+                line = f"S{num:<3} {sname[:35]:<35} {ep_count} episode(s)"
+                attr = curses.color_pair(5) if idx == self.season_selected else 0
+                if seasons_top + i < bottom:
+                    safe_addstr(stdscr, seasons_top + i, 4, line, attr)
+        else:
+            if row < bottom:
+                safe_addstr(stdscr, row, 2, "Overview:", curses.A_UNDERLINE)
+                row += 1
+            for line in textwrap.wrap(overview, max(10, w - 6)):
+                if row >= bottom:
+                    break
+                safe_addstr(stdscr, row, 4, line)
+                row += 1
+
+    def draw_episode_list(self, list_top, list_height, w):
+        stdscr = self.stdscr
+        show_name = self.detail.get("name") if self.detail else "?"
+        season_num = self.season_data.get("season_number", "?") if self.season_data else "?"
+        header = f"{show_name} — Season {season_num}  ({len(self.episodes)} episodes)"
+        safe_addstr(stdscr, list_top - 1, 0, header.ljust(w), curses.A_UNDERLINE)
+        if not self.episodes:
+            safe_addstr(stdscr, list_top, 2, "(no episodes found for this season)")
+            return
+        self.episode_offset = self.adjust_scroll(self.episode_selected, self.episode_offset, list_height)
+        visible = self.episodes[self.episode_offset: self.episode_offset + list_height]
+        for row, ep in enumerate(visible):
+            i = row + self.episode_offset
+            num = ep.get("episode_number", "?")
+            name = ep.get("name") or "?"
+            date = ep.get("air_date") or "----------"
+            rating = ep.get("vote_average") or 0
+            line = f"E{num:<3} {name[:42]:<42} {date}  \u2605{rating:.1f}"
+            attr = curses.color_pair(5) if i == self.episode_selected else 0
+            safe_addstr(stdscr, list_top + row, 2, line, attr)
+
+    def draw_episode_detail(self, top, bottom, w):
+        stdscr = self.stdscr
+        ep = self.episode_detail
+        if ep is None:
+            safe_addstr(stdscr, top, 2, "(no episode loaded)")
+            return
+        show_name = self.detail.get("name") if self.detail else "?"
+        season_num = ep.get("season_number", "?")
+        num = ep.get("episode_number", "?")
+        name = ep.get("name") or "?"
+        date = ep.get("air_date") or "?"
+        rating = ep.get("vote_average") or 0
+        overview = ep.get("overview") or "(no overview)"
+        
+        row = top
+        if row < bottom:
+            safe_addstr(stdscr, row, 2, f"{show_name} — S{season_num}E{num}: {name}", curses.A_BOLD)
+            row += 1
+        if row < bottom:
+            safe_addstr(stdscr, row, 2, f"Air date: {date}   Rating: {rating:.1f}")
+            row += 2
+        if row < bottom:
+            safe_addstr(stdscr, row, 2, "Overview:", curses.A_UNDERLINE)
+            row += 1
+        for line in textwrap.wrap(overview, max(10, w - 6)):
+            if row >= bottom:
+                break
+            safe_addstr(stdscr, row, 4, line)
+            row += 1
+
+    # ---------- input handling ----------
+    def handle_key(self, key):
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            self.stdscr.clear()
+            self.stdscr.refresh()
+            return
+        if self.mode != MODE_NORMAL:
+            self.handle_text_input(key)
+            return
+        if key in (ord("q"), ord("Q")):
+            return "quit"
+        if self.screen == SCREEN_RESULTS:
+            self.handle_key_results(key)
+        elif self.screen == SCREEN_DETAIL:
+            self.handle_key_detail(key)
+        elif self.screen == SCREEN_EPISODES:
+            self.handle_key_episodes(key)
+        elif self.screen == SCREEN_EPISODE_DETAIL:
+            self.handle_key_episode_detail(key)
+
+    def handle_key_results(self, key):
+        if key == 9:  # Tab
+            self.id_lookup_type = "tv" if self.id_lookup_type == "movie" else "movie"
+            self.status = f"ID-lookup type set to {self.id_lookup_type.upper()} (used by the 'i' command)."
+        elif key == ord("/"):
+            self.mode = MODE_SEARCH
+            self.input_buffer = self.title_query
+        elif key == ord("y"):
+            self.mode = MODE_YEAR
+            self.input_buffer = self.year_query
+        elif key == ord("i"):
+            self.mode = MODE_ID
+            self.input_buffer = self.id_query
+        elif key in (curses.KEY_DOWN, ord("j")):
+            if self.results:
+                self.selected = min(self.selected + 1, len(self.results) - 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            if self.results:
+                self.selected = max(self.selected - 1, 0)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            self.open_selected_detail()
+
+    def handle_key_detail(self, key):
+        if key == 27:  # Esc
+            self.detail = None
+            self.season_data = None
+            self.episodes = []
+            self.episode_detail = None
+            self.error = None
+            self.screen = SCREEN_RESULTS
+            self.status = "Back to results."
+            return
+        if key in (ord("p"), ord("P")):
+            self.play_stream()
+            return
+            
+        if not self.detail or self.detail.get("media_type") != "tv":
+            return
+        seasons = self.get_tv_seasons()
+        if key in (curses.KEY_DOWN, ord("j")):
+            if seasons:
+                self.season_selected = min(self.season_selected + 1, len(seasons) - 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            if seasons:
+                self.season_selected = max(self.season_selected - 1, 0)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if seasons:
+                self.select_season(seasons[self.season_selected])
+        elif key == ord("s"):
+            self.mode = MODE_SEASON
+            self.input_buffer = ""
+        elif key in (ord("b"), ord("B")):
+            # self.open_in_browser() # Uncomment if you implement this
+            return
+
+    def handle_key_episodes(self, key):
+        if key in (ord("p"), ord("P")):
+            self.play_stream()
+            return
+        elif key == ord("e"):
+            self.mode = MODE_EPISODE
+            self.input_buffer = ""
+        elif key in (curses.KEY_DOWN, ord("j")):
+            if self.episodes:
+                self.episode_selected = min(self.episode_selected + 1, len(self.episodes) - 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            if self.episodes:
+                self.episode_selected = max(self.episode_selected - 1, 0)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            self.open_episode_by_index(self.episode_selected)
+        elif key == 27:  # Esc
+            self.screen = SCREEN_DETAIL
+            self.error = None
+            self.status = "Back to show details."
+
+    def handle_key_episode_detail(self, key):
+        if key in (ord("p"), ord("P")):
+            self.play_stream()
+            return
+        elif key == 27:  # Esc
+            self.screen = SCREEN_EPISODES
+            self.error = None
+            self.status = "Back to episode list."
+
+    def handle_text_input(self, key):
+        if key == 27:  # Esc cancels typing
+            self.mode = MODE_NORMAL
+            self.input_buffer = ""
+            return
+        if key in (curses.KEY_ENTER, 10, 13):
+            value = self.input_buffer.strip()
+            mode = self.mode
+            self.mode = MODE_NORMAL
+            if mode == MODE_SEARCH:
+                self.title_query = value
+                self.do_search()
+            elif mode == MODE_YEAR:
+                self.year_query = value
+                if self.title_query:
+                    self.do_search()
+            elif mode == MODE_ID:
+                self.id_query = value
+                self.do_id_lookup()
+            elif mode == MODE_SEASON:
+                if value:
+                    self.load_season(value)
+                else:
+                    self.status = "Type a season number first."
+            elif mode == MODE_EPISODE:
+                if value:
+                    self.open_episode_by_number(value)
+                else:
+                    self.status = "Type an episode number first."
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_buffer = self.input_buffer[:-1]
+            return
+        if 32 <= key <= 126:
+            self.input_buffer += chr(key)
+
+    # ---------- main loop ----------
+    def run(self):
+        self.draw()
+        while True:
+            key = self.stdscr.getch()
+            result = self.handle_key(key)
+            if result == "quit":
+                break
+            self.draw()
+
+
+def main(stdscr):
+    app = App(stdscr)
+    app.run()
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(main)
