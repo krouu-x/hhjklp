@@ -114,3 +114,7 @@ Make sure your terminal is large enough for the interface.
 - `mpv` is only needed for playback.
 - Playback depends on external stream APIs and may not always work.
 - Use the application only with content and services you are legally allowed to access.
+
+CONTRIBUTIONS
+
+I'd love if u contribute to this, adding more api keys making more tv shows and movies accessible and more functionalities
