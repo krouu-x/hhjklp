@@ -2,6 +2,11 @@
 
 A simple keyboard-driven TUI for browsing movies and TV shows with TMDB and playing streams with `mpv`. Free movie player with third party api keys which i reversed engineered, no ads, no popups, only terminal is required!
 
+Here's a preview!
+
+https://www.instagram.com/p/DdUSatsAhr8/?hl=en
+i couldnt find a way to add an embed so i added a link instead!
+
 ## Requirements
 
 - Python 3
