@@ -2,21 +2,42 @@
 """
 tmdb_tui.py — an interactive terminal UI for browsing TMDB (The Movie Database),
 in the spirit of btop/htop/claude-code's TUI: live panels, keyboard-driven.
+
+NOTE: set your TMDB API token before running:
+    export TMDB_API_TOKEN="your_token_here"
 """
 import os
-# Must be set before curses.initscr() runs — this is what controls how long
-# ncurses waits after Esc to see if more bytes (an arrow key / alt sequence)
-# are coming. Default is ~1000ms, which is the perceptible "lag" on Esc.
 os.environ.setdefault("ESCDELAY", "25")
 import curses
 import locale
+import logging
+import threading
+import time
 import textwrap
-import requests
 import subprocess
-# from tmdb_config import TMDB_API_TOKEN, TMDB_BASE_URL
+import json
+import re
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Callable, List, Tuple, Dict, Optional
+from urllib.parse import urlparse, parse_qs, quote
 
-TMDB_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1YjFjM2M4ZDg3MTU1MWU2NDg0N2FlNGQ5NTRlMDgwNyIsIm5iZiI6MTc4NjU2MTM5Ni43OTMsInN1YiI6IjZhN2NjMzc0ZmI3YTFjMjkwMTQ0ZmRlYSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.heOiSMRVHPZiCerBZK-91bqtqclEDjCbnzbYpFQo56w"
-TMDB_BASE_URL = "https://api.themoviedb.org/3"
+from curl_cffi import requests
+from bs4 import BeautifulSoup
+
+log = logging.getLogger("tmdb_tui")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+TMDB_API_TOKEN = os.environ.get(
+    "TMDB_API_TOKEN",
+    "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1YjFjM2M4ZDg3MTU1MWU2NDg0N2FlNGQ5NTRlMDgwNyIsIm5iZiI6MTc4NjU2MTM5Ni43OTMsInN1YiI6IjZhN2NjMzc0ZmI3YTFjMjkwMTQ0ZmRlYSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.heOiSMRVHPZiCerBZK-91bqtqclEDjCbnzbYpFQo56w",
+)
+TMDB_BASE_URL = os.environ.get("TMDB_BASE_URL", "https://api.themoviedb.org/3")
 
 HEADERS = {
     "Authorization": f"Bearer {TMDB_API_TOKEN}",
@@ -35,19 +56,746 @@ SCREEN_DETAIL = "detail"
 SCREEN_EPISODES = "episodes"
 SCREEN_EPISODE_DETAIL = "episode_detail"
 
-PLAYER = "vlc"
-# Below this size we don't even try to lay out the normal screens — packing
-# everything in just causes overlapping text. We show a "resize" notice instead.
 MIN_WIDTH = 50
 MIN_HEIGHT = 10
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# Provider 4 tuning knobs
+PAGE_TIMEOUT = 12           # seconds, per page fetch
+MIRROR_WORKERS = 4         # bounded parallelism for mirror resolution
+MAX_MIRRORS_PER_RELEASE = 6
+SEARCH_TTL = 600           # seconds search results stay cached
+SEARCH_CACHE_MAX = 64      # cache bound
+
+
+@dataclass
+class StreamProvider:
+    name: str
+    key: str
+    # (tmdb_id, title, media_type, season_num, episode_num, year) -> [(url, headers)]
+    fetch_func: Callable[..., List[Tuple[str, Dict[str, str]]]]
+
+
+# =============================================================================
+# 4KHDHub provider
+# =============================================================================
+
+FOURKHDHUB_DOMAINS = [
+    "https://4khdhub.link",
+    "https://4khdhub.dad",
+    "https://4khdhub.one",
+    "https://4khub.com",
+]
+
+_SEARCH_CACHE: Dict[str, Tuple[float, List[Dict]]] = {}
+_SEARCH_CACHE_LOCK = threading.Lock()
+_TLS = threading.local()
+
+
+def _4k_session() -> requests.Session:
+    """One impersonated session per calling thread (curl_cffi sessions are not
+    documented as thread-safe, so workers each get their own)."""
+    s = getattr(_TLS, "session", None)
+    if s is None:
+        s = requests.Session(impersonate="chrome120")
+        s.headers.update(BROWSER_HEADERS)
+        _TLS.session = s
+    return s
+
+
+def _norm_title(t: str) -> str:
+    """Lowercase, strip (year)/Season N/punctuation for comparison."""
+    t = t.lower()
+    t = re.sub(r"\((?:19|20)\d{2}\)", " ", t)
+    t = re.sub(r"\bseason\s*\d+\b", " ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return " ".join(t.split())
+
+
+def _4khdhub_search(query: str) -> List[Dict]:
+    key = _norm_title(query)
+    now = time.time()
+
+    with _SEARCH_CACHE_LOCK:
+        hit = _SEARCH_CACHE.get(key)
+        if hit and now - hit[0] < SEARCH_TTL:
+            log.info("search cache hit: %r", query)
+            return hit[1]
+
+    session = _4k_session()
+    last_err = None
+    items: List[Dict] = []
+    seen_paths = set()
+
+    for domain in FOURKHDHUB_DOMAINS:
+        url = f"{domain}/?s={quote(query)}"
+        try:
+            resp = session.get(url, timeout=PAGE_TIMEOUT)
+            if resp.status_code != 200:
+                log.warning("search %s -> HTTP %s", domain, resp.status_code)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            cards = soup.select("a.movie-card") or soup.select(
+                ".post-title a, .entry-title a, article a, .movie-item a"
+            )
+
+            for card in cards:
+                href = card.get("href")
+                if not href:
+                    continue
+
+                title_el = card.select_one(".movie-card-title, .title, h2, h3")
+                title = title_el.get_text(strip=True) if title_el else card.get_text(strip=True)
+                if not title or len(title) < 2:
+                    continue
+
+                meta_el = card.select_one(".movie-card-meta, .meta")
+                meta = meta_el.get_text(strip=True) if meta_el else title
+                year_match = re.search(r"\b(19|20)\d{2}\b", meta)
+                year = year_match.group(0) if year_match else None
+
+                media_type = (
+                    "Series"
+                    if any(k in href.lower() for k in ["-series-", "/series/", "season"])
+                    else "Movie"
+                )
+                path = urlparse(href).path
+                if path in seen_paths:  # cross-domain duplicates
+                    continue
+                seen_paths.add(path)
+
+                items.append({
+                    "id": path,
+                    "title": title,
+                    "media_type": media_type,
+                    "year": year,
+                    "base_domain": domain,
+                })
+
+            if items:
+                log.info("search %r: %d hits via %s", query, len(items), domain)
+                break
+
+        except Exception as e:
+            last_err = e
+            log.warning("search %s failed: %s", domain, e)
+            continue
+
+    if not items:
+        raise Exception(
+            f"No 4KHDHub search results (mirrors down or blocked). Last error: {last_err}"
+        )
+
+    with _SEARCH_CACHE_LOCK:
+        if len(_SEARCH_CACHE) >= SEARCH_CACHE_MAX:
+            _SEARCH_CACHE.clear()
+        _SEARCH_CACHE[key] = (time.time(), items)
+    return items
+
+
+def _4khdhub_pick_match(
+    results: List[Dict], title: str, year: str, media_type: str
+) -> Tuple[Dict, float]:
+    """Rank candidates by title similarity, media type, and release year.
+    Returns (best, score). Logs a warning when the top two scores are close."""
+    want = _norm_title(title)
+    target_type = "Series" if media_type == "tv" else "Movie"
+
+    def score(r: Dict) -> float:
+        s = SequenceMatcher(None, want, _norm_title(r.get("title", ""))).ratio() * 10.0
+        s += 3.0 if r.get("media_type") == target_type else -2.0
+        ry, wy = r.get("year"), (year or None)
+        if wy and ry:
+            s += 4.0 if ry == wy else -3.0
+        return s
+
+    ranked = sorted(results, key=score, reverse=True)
+    best = ranked[0]
+    best_score = score(best)
+    if len(ranked) > 1 and score(ranked[1]) >= best_score - 0.5:
+        log.warning(
+            "ambiguous match for %r: %r (%.1f) vs %r (%.1f)",
+            title, ranked[0]["title"], best_score, ranked[1]["title"], score(ranked[1]),
+        )
+    return best, best_score
+
+
+def _4khdhub_get_releases(
+    domain: str, id_path: str, season: int = 0, episode: int = 0
+) -> List[Dict]:
+    url = f"{domain}{id_path}"
+    session = _4k_session()
+    resp = session.get(url, timeout=PAGE_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    if season > 0:
+        items = soup.select("#episodes .episode-download-item")
+        title_sel = ".episode-file-title"
+    else:
+        items = soup.select(".download-item")
+        title_sel = ".file-title"
+
+    releases = []
+    for item in items:
+        title_el = item.select_one(title_sel)
+        filename = title_el.get_text(strip=True) if title_el else ""
+        if not filename or filename.lower().endswith(".zip"):
+            continue
+
+        if season > 0:
+            m = re.search(r"S(\d+)E(\d+)", filename, re.IGNORECASE)
+            if not m:
+                continue
+            if int(m.group(1)) != season or int(m.group(2)) != episode:
+                continue
+
+        mirrors = []
+        for link in item.select("a[href]"):
+            href = link.get("href", "")
+            if not href.startswith("https://") or "logout" in href:
+                continue
+            label = link.get_text(strip=True) or "Source"
+            mirrors.append({"url": href, "label": label})
+
+        if mirrors:
+            releases.append({"filename": filename, "mirrors": mirrors})
+
+    return releases
+
+
+def _4khdhub_decode_greenmotors(html: str) -> Optional[str]:
+    match = re.search(r"s\(\s*'o'\s*,\s*'([^']+)'\s*", html)
+    if not match:
+        return None
+
+    payload = match.group(1)
+    try:
+        step1 = base64.b64decode(payload).decode("utf-8")
+        step2 = base64.b64decode(step1).decode("utf-8")
+        step3 = step2.translate(str.maketrans(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm"
+        ))
+        step4 = base64.b64decode(step3).decode("utf-8")
+        data = json.loads(step4)
+
+        target_b64 = data.get("o") or data.get("url") or data.get("link")
+        if target_b64:
+            return base64.b64decode(target_b64).decode("utf-8")
+    except Exception:
+        pass
+    return None
+
+
+def _4khdhub_resolve_mirror(mirror_url: str, session: requests.Session) -> Optional[str]:
+    try:
+        # Step 1: Intermediate greenmotors / greenmountmotors mediators
+        if any(d in mirror_url for d in ["greenmotors", "greenmountmotors"]):
+            resp = session.get(mirror_url, timeout=10)
+            target = _4khdhub_decode_greenmotors(resp.text)
+            if target:
+                return _4khdhub_resolve_mirror(target, session)
+            return None
+
+        # Step 2: HubDrive route -> redirect to HubCloud
+        elif "hubdrive." in mirror_url:
+            resp = session.get(mirror_url, timeout=10)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                if "hubcloud." in href:
+                    return _4khdhub_resolve_mirror(href, session)
+
+        # Step 3: HubCloud extraction
+        elif "hubcloud." in mirror_url:
+            resp = session.get(mirror_url, timeout=10)
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            resolver_url = None
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/download/" in href or "download" in a.get("id", "") or "btn" in " ".join(a.get("class", [])):
+                    if href.startswith("https://"):
+                        resolver_url = href
+                        break
+
+            if not resolver_url:
+                return None
+
+            resp2 = session.get(resolver_url, timeout=10)
+            soup2 = BeautifulSoup(resp2.text, "html.parser")
+
+            # Handle pages.dev Base64 redirect targets
+            for a in soup2.select('a[href*="pages.dev"]'):
+                parsed = urlparse(a["href"])
+                qs = parse_qs(parsed.query)
+                if "u" in qs:
+                    try:
+                        decoded = base64.b64decode(qs["u"][0]).decode("utf-8")
+                        if decoded.startswith("https://"):
+                            return decoded.replace("pixeldrain.dev", "pixeldrain.com")
+                    except Exception:
+                        pass
+
+            # Fallback regex extraction for Pixeldrain / raw direct storage links
+            text = resp2.text
+            m = re.search(r"https?://(?:pixeldrain\.(?:dev|com)/(?:u|api/file)/)[^\s\"'<>]+", text)
+            if m:
+                pd_url = m.group(0).replace("pixeldrain.dev", "pixeldrain.com")
+                if "/u/" in pd_url:
+                    pd_url = pd_url.replace("/u/", "/api/file/") + "?download"
+                elif "/api/file/" in pd_url and "?download" not in pd_url:
+                    pd_url += "?download"
+                return pd_url
+
+            return None
+        else:
+            return mirror_url
+    except Exception:
+        return None
+
+
+def _4khdhub_preflight(url: str, session: requests.Session) -> Optional[str]:
+    if not url or not url.startswith("https://"):
+        return None
+
+    parsed = urlparse(url)
+    if parsed.hostname in ("localhost", "127.0.0.1") or url.endswith(".zip"):
+        return None
+
+    try:
+        resp = session.get(url, timeout=10, stream=True)
+        try:
+            if resp.status_code < 400:
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "text/html" in ct or "text/plain" in ct:
+                    return None
+                return resp.url
+            return None
+        finally:
+            resp.close()  # stream=True responses must be closed explicitly
+    except Exception:
+        return None
+
+
+def _4khdhub_try_mirror(mirror_url: str) -> Optional[str]:
+    """Resolve + preflight one mirror. Runs in a worker thread; never raises."""
+    try:
+        resolved = _4khdhub_resolve_mirror(mirror_url, _4k_session())
+        if not resolved:
+            log.info("resolve failed: %s", mirror_url)
+            return None
+        playable = _4khdhub_preflight(resolved, _4k_session())
+        if playable:
+            log.info("playable: %s", playable)
+        return playable
+    except Exception as e:
+        log.warning("mirror %s failed: %s", mirror_url, e)
+        return None
+
+
+def _fetch_fourkhdhub(
+    tmdb_id: str, title: str, media_type: str,
+    season_num: str, episode_num: str, year: str = "",
+) -> List[Tuple[str, Dict[str, str]]]:
+    started = time.perf_counter()
+    log.info("fetch title=%r type=%s year=%s", title, media_type, year)
+
+    results = _4khdhub_search(title)
+    match, score = _4khdhub_pick_match(results, title, year, media_type)
+    log.info("selected %r (%r) score=%.1f", match["title"], match["base_domain"], score)
+
+    season = int(season_num) if media_type == "tv" and season_num else 0
+    episode = int(episode_num) if media_type == "tv" and episode_num else 0
+
+    releases = _4khdhub_get_releases(match["base_domain"], match["id"], season, episode)
+    if not releases:
+        raise Exception("No 4KHDHub releases found")
+    log.info("%d releases for S%sE%s", len(releases), season or "-", episode or "-")
+
+    # Flatten to unique mirror jobs, bounded per release.
+    jobs, seen = [], set()
+    for release in releases:
+        for mirror in release["mirrors"][:MAX_MIRRORS_PER_RELEASE]:
+            if mirror["url"] not in seen:
+                seen.add(mirror["url"])
+                jobs.append(mirror["url"])
+
+    candidate_streams: List[Tuple[str, Dict[str, str]]] = []
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(MIRROR_WORKERS, len(jobs))) as ex:
+            futures = {ex.submit(_4khdhub_try_mirror, u): u for u in jobs}
+            for fut in as_completed(futures):
+                playable = fut.result()
+                if playable:
+                    candidate_streams.append((
+                        playable,
+                        {"User-Agent": BROWSER_HEADERS["User-Agent"]},
+                    ))
+
+    elapsed = time.perf_counter() - started
+    log.info("fetch done: %d playable stream(s) in %.2fs", len(candidate_streams), elapsed)
+
+    if not candidate_streams:
+        raise Exception("No playable 4KHDHub streams resolved (see tmdb_tui.log)")
+    return candidate_streams
+
+
+# =============================================================================
+# Dramachi provider
+# =============================================================================
+
+def _fetch_dramachi(
+    tmdb_id: str, title: str, media_type: str,
+    season_num: str, episode_num: str, year: str = "",
+) -> List[Tuple[str, Dict[str, str]]]:
+    base_url = "https://api.nodeobjects.com/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    queries_to_try = [title]
+    no_year = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+    if no_year != title:
+        queries_to_try.append(no_year)
+    cleaned = re.sub(r"[:\-]", " ", title).strip()
+    if cleaned != title:
+        queries_to_try.append(cleaned)
+    if ":" in title:
+        main_title = title.split(":")[0].strip()
+        if main_title != title:
+            queries_to_try.append(main_title)
+
+    items = []
+    for query in queries_to_try:
+        encoded_q = quote(query, safe="")
+        search_url = f"{base_url}?interface=search&q={encoded_q}&filter=all&page=1"
+        resp = requests.get(search_url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data") or []
+        if items:
+            break
+
+    if not items:
+        raise Exception(f"No Dramachi search results found for '{title}'")
+
+    is_movie_target = (media_type == "movie")
+    match = None
+    for item in items:
+        content = (item.get("content") or "").lower()
+        is_movie_result = content in ["movies", "movie"]
+        if is_movie_result == is_movie_target:
+            match = item
+            break
+
+    if not match:
+        match = items[0]
+
+    title_id = str(match.get("id", "")).strip()
+    if not title_id:
+        raise Exception("Dramachi match missing ID")
+
+    rip_to_query = "hd Rip"
+    if media_type == "tv" and season_num:
+        try:
+            season_int = int(season_num)
+            season_key = f"Season {season_int:02d}"
+        except ValueError:
+            season_key = "Season 01"
+
+        details_url = f"{base_url}?interface=title_v2&id={quote(title_id)}"
+        det_resp = requests.get(details_url, headers=headers, timeout=15)
+        det_resp.raise_for_status()
+        det_data = det_resp.json()
+
+        seasons = det_data.get("seasons") or {}
+        target_rip = None
+
+        if season_key in seasons:
+            versions = seasons[season_key].get("versions") or []
+            if versions:
+                target_rip = versions[0].get("rip")
+
+        if not target_rip:
+            for s_name, s_data in seasons.items():
+                versions = s_data.get("versions") or []
+                if versions:
+                    target_rip = versions[0].get("rip")
+                    break
+
+        if not target_rip:
+            target_rip = season_key
+        rip_to_query = target_rip
+
+    eplist_url = f"{base_url}?interface=eplist&season={quote(rip_to_query)}&id={quote(title_id)}"
+    ep_resp = requests.get(eplist_url, headers=headers, timeout=15)
+    ep_resp.raise_for_status()
+    ep_data = ep_resp.json()
+    episodes = ep_data.get("episode_list") or []
+
+    if not episodes:
+        raise Exception(f"No episodes found for Dramachi RIP: {rip_to_query}")
+
+    def parse_ep_num(f_title: str) -> int:
+        m = re.search(r"E(\d+)", f_title, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        tokens = f_title.split()
+        if tokens:
+            try:
+                return int(tokens[-1])
+            except ValueError:
+                pass
+        return 9999
+
+    episodes.sort(key=lambda ep: parse_ep_num(ep.get("f_title", "")))
+
+    target_ep = int(episode_num) if episode_num else 0
+    if target_ep > 0:
+        matched_episodes = [ep for ep in episodes if parse_ep_num(ep.get("f_title", "")) == target_ep]
+        if not matched_episodes and target_ep <= len(episodes):
+            matched_episodes = [episodes[target_ep - 1]]
+    else:
+        matched_episodes = episodes
+
+    if not matched_episodes:
+        raise Exception(f"Episode {episode_num} not found in Dramachi")
+
+    candidate_streams = []
+    for ep in matched_episodes:
+        fid = ep.get("fid")
+        disk = ep.get("disk")
+        if not fid or not disk:
+            continue
+
+        file_url = f"{base_url}?interface=getFile&fid={quote(str(fid))}&findex={quote(str(disk))}"
+        file_resp = requests.get(file_url, headers=headers, timeout=15)
+        file_resp.raise_for_status()
+        file_data = file_resp.json()
+
+        host_info = file_data.get("hostInfo")
+        file_info_list = file_data.get("fileInfo") or []
+
+        if not host_info or not file_info_list:
+            continue
+
+        host = str(host_info.get("host", "")).strip("/")
+        raw_url = file_info_list[0].get("url", "")
+
+        if host and raw_url:
+            stream_url = f"https://{host}/cdn/{raw_url.lstrip('/')}"
+            hdrs = {
+                "Referer": "https://dramachi.com/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            }
+            candidate_streams.append((stream_url, hdrs))
+
+    if not candidate_streams:
+        raise Exception("No playable streams resolved from Dramachi")
+
+    return candidate_streams
+
+
+# =============================================================================
+# Other providers
+# =============================================================================
+
+def _fetch_moviebox(
+    tmdb_id: str, title: str, media_type: str,
+    season_num: str, episode_num: str, year: str = "",
+) -> List[Tuple[str, Dict[str, str]]]:
+    try:
+        import moviebox_tui
+    except ImportError as e:
+        raise Exception(f"Rust provider not installed: {e}. Run 'maturin develop --release --features python'")
+
+    if not hasattr(moviebox_tui, "search_moviebox") or not hasattr(moviebox_tui, "get_moviebox_streams"):
+        raise AttributeError("moviebox_tui module is missing required functions")
+
+    try:
+        search_res_json = moviebox_tui.search_moviebox(title)
+    except Exception as e:
+        raise Exception(f"MovieBox search call failed: {e}")
+
+    try:
+        search_results = json.loads(search_res_json)
+    except Exception as e:
+        raise Exception(f"MovieBox search returned invalid JSON: {e}")
+
+    if not isinstance(search_results, list) or not search_results:
+        raise Exception("No matching MovieBox result found")
+
+    target_type = "tv" if media_type == "tv" else "movie"
+    match = next(
+        (r for r in search_results
+         if isinstance(r, dict) and r.get("media_type") == target_type and r.get("id")),
+        None,
+    )
+    if not match:
+        match = next((r for r in search_results if isinstance(r, dict) and r.get("id")), None)
+
+    if not match or not match.get("id"):
+        raise Exception("No matching MovieBox result found with a valid id")
+
+    subject_id = str(match["id"]).strip()
+    season_val = int(season_num) if media_type == "tv" and season_num else None
+    episode_val = int(episode_num) if media_type == "tv" and episode_num else None
+
+    try:
+        streams_json = moviebox_tui.get_moviebox_streams(
+            subject_id=subject_id, season=season_val, episode=episode_val
+        )
+    except Exception as e:
+        raise Exception(f"MovieBox get_streams call failed: {e}")
+
+    try:
+        streams = json.loads(streams_json)
+    except Exception as e:
+        raise Exception(f"MovieBox streams returned invalid JSON: {e}")
+
+    candidate_streams = []
+    for s in streams:
+        if not isinstance(s, dict):
+            continue
+        url = s.get("url")
+        if not url or not isinstance(url, str) or not url.strip():
+            continue
+
+        raw_headers = s.get("headers")
+        hdr_dict: Dict[str, str] = {}
+        if isinstance(raw_headers, dict):
+            hdr_dict = {str(k): str(v) for k, v in raw_headers.items()}
+        elif isinstance(raw_headers, list):
+            for item in raw_headers:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    hdr_dict[str(item[0])] = str(item[1])
+                elif isinstance(item, dict):
+                    for k, v in item.items():
+                        hdr_dict[str(k)] = str(v)
+        candidate_streams.append((url.strip(), hdr_dict))
+
+    if not candidate_streams:
+        raise Exception("No valid streams returned by MovieBox")
+    return candidate_streams
+
+
+def _fetch_vidlove(
+    tmdb_id: str, title: str, media_type: str,
+    season_num: str, episode_num: str, year: str = "",
+) -> List[Tuple[str, Dict[str, str]]]:
+    endpoint = "tv" if media_type == "tv" else "movie"
+    url = f"https://api.vidlove.cc/{endpoint}"
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    sources = ["megaknight", "vidapi", "cinefreak", "moviebox2"]
+
+    for source in sources:
+        params = {"id": tmdb_id, "mode": "json", "sources": source, "hevc": 1}
+        if media_type == "tv":
+            params["season"] = season_num
+            params["episode"] = episode_num
+
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        source_data = data.get("source")
+        if source_data and isinstance(source_data, dict):
+            stream_url = source_data.get("url")
+            if stream_url:
+                stream_headers = source_data.get(
+                    "headers", {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                )
+                return [(stream_url, stream_headers)]
+    raise Exception("All Vidlove sources failed")
+
+
+
+def _fetch_peestream(
+    tmdb_id: str,
+    title: str,
+    media_type: str,
+    season_num: str,
+    episode_num: str,
+    year: str = "",
+) -> List[Tuple[str, Dict[str, str]]]:
+
+    url = "https://api.peestream.in/api/search/stream"
+    params = {
+        "q": tmdb_id,
+        "type": media_type,
+    }
+
+    if media_type == "tv":
+        params["season"] = season_num
+        params["episode"] = episode_num
+
+    response = requests.get(url, params=params, timeout=15)
+    response.raise_for_status()
+
+    # Parse SSE events and find the final JSON payload.
+    data = None
+    event_name = None
+
+    for line in response.text.splitlines():
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+
+        elif line.startswith("data:") and event_name == "done":
+            data = json.loads(line[5:].strip())
+            break
+
+    if data is None:
+        raise Exception("Peestream returned no done event")
+
+    candidate_streams = []
+
+    for result in data.get("results", []):
+        for stream in result.get("streams", []):
+            stream_url = stream.get("url")
+
+            if stream_url:
+                candidate_streams.append(
+                    (stream_url, stream.get("headers", {}))
+                )
+
+    if not candidate_streams:
+        raise Exception(
+            f"No Peestream results found for {tmdb_id}"
+        )
+
+    return candidate_streams
+
+
+
+# =============================================================================
+# Provider configuration
+# =============================================================================
+
+PROVIDERS = [
+    StreamProvider(name="PROVIDER 1", key="1", fetch_func=_fetch_fourkhdhub),
+    StreamProvider(name="PROVIDER 2", key="2", fetch_func=_fetch_dramachi),
+    StreamProvider(name="PROVIDER 3", key="3", fetch_func= _fetch_peestream),
+]
+
+
 # ---------------------------------------------------------------------------
-# API client
+# TMDB API client
 # ---------------------------------------------------------------------------
+
 class TMDBClient:
-    """Thin wrapper around the TMDB v3 API. Every method returns (data, error)
-    — error is None on success, or a short human-readable string on failure.
-    Nothing here ever raises; the UI layer never needs to catch anything."""
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -59,25 +807,26 @@ class TMDBClient:
             return None, "Request timed out."
         except requests.exceptions.RequestException as e:
             return None, f"Network error: {e}"
+
         if resp.status_code != 200:
             return None, f"HTTP {resp.status_code}"
+
         try:
             return resp.json(), None
         except ValueError:
             return None, "Malformed JSON response."
 
     def search_multi(self, title: str, year: str = ""):
-        """Searches movies AND tv shows in one call via TMDB's multi-search.
-        Filters out 'person' results and keeps each item's media_type."""
         data, err = self._get_json(f"{TMDB_BASE_URL}/search/multi", params={"query": title})
         if err:
             return [], err
+
         results = [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")]
         if year:
-            def year_of(r):
-                date = r.get("release_date") or r.get("first_air_date") or ""
-                return date[:4]
-            results = [r for r in results if year_of(r) == year]
+            results = [
+                r for r in results
+                if (r.get("release_date") or r.get("first_air_date") or "")[:4] == year
+            ]
         return results, None
 
     def get_by_id(self, media_type: str, tmdb_id):
@@ -89,9 +838,6 @@ class TMDBClient:
 
 
 def safe_addstr(win, y, x, text, attr=0):
-    """Never lets a curses write outside the window crash the app —
-    truncates to the available width and swallows the edge-case curses.error
-    that happens when writing to the exact bottom-right cell."""
     h, w = win.getmaxyx()
     if 0 <= y < h and 0 <= x < w:
         try:
@@ -103,35 +849,28 @@ def safe_addstr(win, y, x, text, attr=0):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
 class App:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.client = TMDBClient()
-        self.id_lookup_type = "movie"  # only for the direct 'i' lookup
+        self.id_lookup_type = "movie"
 
-        # search / lookup fields
         self.title_query = ""
         self.year_query = ""
         self.id_query = ""
 
-        # navigation state
         self.screen = SCREEN_RESULTS
         self.mode = MODE_NORMAL
         self.input_buffer = ""
 
-        # results list
         self.results = []
         self.selected = 0
         self.results_offset = 0
-
-        # movie or tv show detail (dict; media_type is stamped onto it)
         self.detail = None
 
-        # season selection (index into detail["seasons"]) — lives on the tv detail screen
         self.season_selected = 0
         self.season_offset = 0
-
-        # currently loaded season + its episodes
         self.season_data = None
         self.episodes = []
         self.episode_selected = 0
@@ -142,19 +881,18 @@ class App:
         self.error = None
 
         curses.curs_set(0)
-        curses.start_color()
+        curses.start_colors_compat = curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)     # header
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # highlight / accents
-        curses.init_pair(3, curses.COLOR_GREEN, -1)    # status
-        curses.init_pair(4, curses.COLOR_RED, -1)      # error
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
-        curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # media-type tag
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
 
         stdscr.nodelay(False)
         stdscr.keypad(True)
 
-    # ---------- small pure helpers ----------
     @staticmethod
     def adjust_scroll(selected, offset, height):
         if height <= 0:
@@ -183,8 +921,7 @@ class App:
     def get_tv_seasons(self):
         if not self.detail or self.detail.get("media_type") != "tv":
             return []
-        seasons = self.detail.get("seasons", [])
-        return sorted(seasons, key=lambda s: s.get("season_number", 0))
+        return sorted(self.detail.get("seasons", []), key=lambda s: s.get("season_number", 0))
 
     def find_episode_by_number(self, num: int):
         for idx, ep in enumerate(self.episodes):
@@ -192,7 +929,13 @@ class App:
                 return idx
         return None
 
-    # ---------- data actions ----------
+    def _get_provider_idx_by_key(self, key: int) -> Optional[int]:
+        char = chr(key)
+        for idx, provider in enumerate(PROVIDERS):
+            if provider.key == char:
+                return idx
+        return None
+
     def do_search(self):
         if not self.title_query:
             self.status = "Type a title first (/)."
@@ -209,8 +952,9 @@ class App:
         self.results_offset = 0
         self.detail = None
         self.screen = SCREEN_RESULTS
-        self.status = f"{len(results)} result(s) for '{self.title_query}'" + (
-            f" ({self.year_query})" if self.year_query else ""
+        self.status = (
+            f"{len(results)} result(s) for '{self.title_query}'"
+            + (f" ({self.year_query})" if self.year_query else "")
         )
 
     def do_id_lookup(self):
@@ -263,8 +1007,7 @@ class App:
             self.status = err
             return
         seasons = self.get_tv_seasons()
-        valid_numbers = [s.get("season_number") for s in seasons]
-        if num not in valid_numbers:
+        if num not in [s.get("season_number") for s in seasons]:
             self.status = f"Season {num} does not exist for this show."
             return
         tv_id = self.detail.get("id")
@@ -311,20 +1054,18 @@ class App:
             return
         self.open_episode_by_index(idx)
 
-    def play_stream(self):
-        """Fetches stream URLs from APIs and tries them sequentially with mpv."""
+    def play_stream(self, start_provider_idx=None):
         if not self.detail:
             self.status = "No media selected."
             return
-        
+
         media_type = self.detail.get("media_type", "movie")
         tmdb_id = str(self.detail.get("id", ""))
         title = self.detail.get("title") or self.detail.get("name", "")
-        year = (self.detail.get("release_date") or self.detail.get("first_air_date", ""))[:4]
-        
+        year = (self.detail.get("release_date") or self.detail.get("first_air_date") or "")[:4]
+
         season_num = "1"
         episode_num = "1"
-        
         if media_type == "tv":
             if not self.season_data or not self.episode_detail:
                 self.status = "Please select a season and episode first."
@@ -332,197 +1073,106 @@ class App:
             season_num = str(self.season_data.get("season_number", "1"))
             episode_num = str(self.episode_detail.get("episode_number", "1"))
 
-        self.status = "Fetching stream URLs..."
-        self.draw()
-        self.stdscr.refresh()
-        
-        # Temporarily release the terminal so mpv can take full control
-        curses.endwin()
-        
-        # List of tuples: (url, headers_dict)
-        candidate_streams = []
-        
-        # =========================================================================
-        # API 1: Primary (vidlove)
-        # =========================================================================
-        try:
-            endpoint = "tv" if media_type == "tv" else "movie"
-            url1 = f"https://api.vidlove.cc/{endpoint}"
+        start_idx = start_provider_idx if start_provider_idx is not None else 0
+        start_idx = max(0, min(start_idx, len(PROVIDERS) - 1))
 
-            headers1 = {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-            }
+        for idx in range(start_idx, len(PROVIDERS)):
+            provider = PROVIDERS[idx]
+            self.status = f"Fetching streams from {provider.name}..."
+            self.draw()
+            self.stdscr.refresh()
 
-            sources = [
-                "megaknight",
-                "vidapi",
-                "cinefreak",
-                "moviebox2"
-            ]
-
-            response_data = None
-            successful_source = None
-
-            for source in sources:
-                params1 = {
-                    "id": tmdb_id,
-                    "mode": "json",
-                    "sources": source,
-                    "hevc": 1
-                }
-
-                # TV needs season/episode
-                if media_type == "tv":
-                    params1["season"] = season_num
-                    params1["episode"] = episode_num
-
-                try:
-                    r = requests.get(
-                        url1,
-                        headers=headers1,
-                        params=params1,
-                        timeout=15
-                    )
-
-                    r.raise_for_status()
-
-                    data = r.json()
-
-                    # Check that the response actually contains a stream
-                    source_data = data.get("source")
-
-                    if not source_data or not isinstance(source_data, dict):
-                        print(f"Source {source} returned no stream")
-                        continue
-
-                    stream_url = source_data.get("url")
-
-                    if not stream_url:
-                        print(f"Source {source} returned no URL")
-                        continue
-
-                    # Success
-                    response_data = data
-                    successful_source = source
-
-                    print(f"Using source: {source}")
-
-                    stream_headers = source_data.get(
-                        "headers",
-                        {
-                            "User-Agent": (
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                            )
-                        }
-                    )
-
-                    candidate_streams.append(
-                        (stream_url, stream_headers)
-                    )
-
-                    break
-
-                except (requests.RequestException, ValueError) as e:
-                    print(f"Source {source} failed: {e}")
-                    continue
-
-            # All sources failed
-            if response_data is None:
-                raise Exception("All Vidlove sources failed")
-
-        except Exception as e:
-            print(f"Primary API failed: {e}")
-
-        # =========================================================================
-        # API 2: Fallback
-        # =========================================================================
-        if not candidate_streams:
             try:
-                url2 = "https://api.peestream.in/api/search"
-                params2 = {"q": tmdb_id, "type": media_type}
-                if media_type == "tv":
-                    params2["season"] = season_num
-                    params2["episode"] = episode_num
-                    
-                response = requests.get(url2, params=params2, timeout=15)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract all stream URLs and their specific headers
-                for result in data.get("results", []):
-                    for stream in result.get("streams", []):
-                        stream_url = stream.get("url")
-                        if stream_url:
-                            stream_headers = stream.get("headers", {})
-                            candidate_streams.append((stream_url, stream_headers))
+                candidate_streams = provider.fetch_func(
+                    tmdb_id, title, media_type, season_num, episode_num, year=year
+                )
             except Exception as e:
-                print(f"Fallback API failed: {e}")
+                log.warning("%s failed: %s", provider.name, e)
+                self.status = f"{provider.name} failed, falling back to next provider..."
+                self.draw()
+                self.stdscr.refresh()
+                continue
 
-        # =========================================================================
-        # Play the streams sequentially until one succeeds
-        # =========================================================================
-        if not candidate_streams:
-            self.status = "No streams found from any API."
-        else:
-            success = False
+            provider_success = False
             for i, (stream_url, stream_headers) in enumerate(candidate_streams):
-                mpv_cmd = ["mpv"]
-                
-                # mpv STRICTLY requires the '=' syntax for options with parameters
+                mpv_cmd = ["mpv", "--no-ytdl"]
+
                 ua = stream_headers.get("User-Agent") or stream_headers.get("user-agent")
                 if ua:
                     mpv_cmd.append(f"--user-agent={ua}")
-                
-                for k, v in stream_headers.items():
-                    if k.lower() != "user-agent":
-                        # Properly quote header fields for mpv
-                        mpv_cmd.append(f'--http-header-fields="{k}: {v}"')
-                        
+
+                referer = stream_headers.get("Referer") or stream_headers.get("referer")
+                if referer:
+                    mpv_cmd.append(f"--referrer={referer}")
+
+                # mpv's documented syntax: comma-separated "Field: value" pairs.
+                # No embedded quotes -- this is an argv list, not a shell command.
+                extra_headers = [
+                    f"{k}: {v}" for k, v in stream_headers.items()
+                    if k.lower() not in ("user-agent", "referer")
+                ]
+                if extra_headers:
+                    mpv_cmd.append("--http-header-fields=" + ",".join(extra_headers))
+
                 mpv_cmd.append(stream_url)
-                
+
                 try:
+                    self.status = f"Playing via {provider.name} (Stream {i + 1})..."
+                    self.draw()
+                    self.stdscr.refresh()
+
+                    curses.endwin()
                     result = subprocess.run(mpv_cmd)
+                    curses.reset_prog_mode()
+                    curses.doupdate()
+                    self.stdscr.refresh()
+
                     if result.returncode == 0:
-                        success = True
-                        break  # Stream played successfully (or closed normally), stop trying others
+                        provider_success = True
+                        break
                     else:
-                        print(f"Stream {i+1} failed (code {result.returncode}). Trying next...")
+                        log.warning("Stream %d failed (mpv code %d)", i + 1, result.returncode)
+
                 except FileNotFoundError:
                     self.status = "Error: 'mpv' executable not found."
-                    success = True  # Break out to avoid looping
+                    provider_success = True
                     break
                 except Exception as e:
-                    print(f"Playback error: {e}")
-            
-            if success:
+                    log.warning("Playback error: %s", e)
+
+            if provider_success:
                 self.status = "Playback finished."
-            else:
-                self.status = "All streams failed to play."
-                
-        # Restore curses screen properly
-        curses.reset_prog_mode()
-        curses.doupdate()
+                self.draw()
+                self.stdscr.refresh()
+                return
+
+            self.status = f"All streams in {provider.name} failed. Trying next provider..."
+            self.draw()
+            self.stdscr.refresh()
+
+        self.status = "All providers failed to find or play streams."
+        self.draw()
         self.stdscr.refresh()
-    
-    # ---------- drawing ----------
+
     def draw(self):
         stdscr = self.stdscr
         stdscr.erase()
         h, w = stdscr.getmaxyx()
+
         if h < MIN_HEIGHT or w < MIN_WIDTH:
             self.draw_too_small(h, w)
             stdscr.refresh()
             return
-        
-        header = f" STUB  — search: movies + tv   |   id-lookup type: {self.id_lookup_type.upper()} (Tab) "
+
+        header = f" TMDB TUI — search: movies + tv   |   id-lookup type: {self.id_lookup_type.upper()} (Tab) "
         safe_addstr(stdscr, 0, 0, header.ljust(w), curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE)
         bar = f" title: {self.title_query or '-'}    year: {self.year_query or '-'}    id: {self.id_query or '-'} "
         safe_addstr(stdscr, 1, 0, bar.ljust(w), curses.color_pair(2))
-        
+
         list_top = 3
         list_bottom = h - 3
         list_height = max(0, list_bottom - list_top)
-        
+
         if self.screen == SCREEN_RESULTS:
             self.draw_results(list_top, list_height, w)
         elif self.screen == SCREEN_DETAIL:
@@ -531,7 +1181,7 @@ class App:
             self.draw_episode_list(list_top, list_height, w)
         elif self.screen == SCREEN_EPISODE_DETAIL:
             self.draw_episode_detail(list_top, list_bottom, w)
-            
+
         if self.mode != MODE_NORMAL:
             prompt = {
                 MODE_SEARCH: "Search title> ",
@@ -543,7 +1193,7 @@ class App:
             safe_addstr(stdscr, h - 2, 0, (prompt + self.input_buffer).ljust(w), curses.A_BOLD)
         else:
             safe_addstr(stdscr, h - 2, 0, self.help_text().ljust(w), curses.color_pair(2) | curses.A_DIM)
-            
+
         status_line = self.error if self.error else self.status
         color = curses.color_pair(4) if self.error else curses.color_pair(3)
         safe_addstr(stdscr, h - 1, 0, status_line.ljust(w), color)
@@ -566,16 +1216,17 @@ class App:
             safe_addstr(stdscr, row, col, line, curses.color_pair(4) | curses.A_BOLD)
 
     def help_text(self):
+        provider_help = "  ".join([f"{p.key} {p.name}" for p in PROVIDERS]) + "  p Play (Auto)"
         if self.screen == SCREEN_RESULTS:
             return " / Search   y Year   i ID lookup   Tab Movie/TV ID type   j/k Move   Enter Open   q Quit"
         if self.screen == SCREEN_DETAIL:
             if self.detail and self.detail.get("media_type") == "tv":
-                return " p Play   j/k Select season   Enter Open season   s Type season #   Esc Back"
-            return " p Play (movie)   Esc Back"
+                return f"{provider_help}   j/k Select season   Enter Open   s Type season #   Esc Back"
+            return f"{provider_help}   Esc Back"
         if self.screen == SCREEN_EPISODES:
-            return " p Play   j/k Select episode   Enter Open   e Jump to episode #   Esc Back"
+            return f"{provider_help}   j/k Select ep   Enter Open   e Jump   Esc Back"
         if self.screen == SCREEN_EPISODE_DETAIL:
-            return " p Play   Esc Back"
+            return f"{provider_help}   Esc Back"
         return ""
 
     @staticmethod
@@ -613,15 +1264,19 @@ class App:
         overview = d.get("overview") or "(no overview)"
         mtype = d.get("media_type", "?")
         tmdb_id = d.get("id", "?")
-        
+
         row = top
         if row < bottom:
-            safe_addstr(stdscr, row, 2, f"{name}  ({date[:4] if date else '?'})  {self._media_tag(mtype)} id={tmdb_id}", curses.A_BOLD)
+            safe_addstr(
+                stdscr, row, 2,
+                f"{name}  ({date[:4] if date else '?'})  {self._media_tag(mtype)} id={tmdb_id}",
+                curses.A_BOLD,
+            )
             row += 1
         if row < bottom:
             safe_addstr(stdscr, row, 2, f"Rating: {rating:.1f}   Genres: {genres}")
             row += 2
-            
+
         if mtype == "tv":
             seasons = self.get_tv_seasons()
             if row < bottom:
@@ -688,7 +1343,6 @@ class App:
         date = ep.get("air_date") or "?"
         rating = ep.get("vote_average") or 0
         overview = ep.get("overview") or "(no overview)"
-        
         row = top
         if row < bottom:
             safe_addstr(stdscr, row, 2, f"{show_name} — S{season_num}E{num}: {name}", curses.A_BOLD)
@@ -705,7 +1359,6 @@ class App:
             safe_addstr(stdscr, row, 4, line)
             row += 1
 
-    # ---------- input handling ----------
     def handle_key(self, key):
         if key == curses.KEY_RESIZE:
             curses.update_lines_cols()
@@ -727,7 +1380,7 @@ class App:
             self.handle_key_episode_detail(key)
 
     def handle_key_results(self, key):
-        if key == 9:  # Tab
+        if key == 9:
             self.id_lookup_type = "tv" if self.id_lookup_type == "movie" else "movie"
             self.status = f"ID-lookup type set to {self.id_lookup_type.upper()} (used by the 'i' command)."
         elif key == ord("/"):
@@ -749,7 +1402,7 @@ class App:
             self.open_selected_detail()
 
     def handle_key_detail(self, key):
-        if key == 27:  # Esc
+        if key == 27:
             self.detail = None
             self.season_data = None
             self.episodes = []
@@ -758,10 +1411,13 @@ class App:
             self.screen = SCREEN_RESULTS
             self.status = "Back to results."
             return
-        if key in (ord("p"), ord("P")):
-            self.play_stream()
+        provider_idx = self._get_provider_idx_by_key(key)
+        if provider_idx is not None:
+            self.play_stream(start_provider_idx=provider_idx)
             return
-            
+        if key in (ord("p"), ord("P")):
+            self.play_stream(start_provider_idx=None)
+            return
         if not self.detail or self.detail.get("media_type") != "tv":
             return
         seasons = self.get_tv_seasons()
@@ -777,13 +1433,14 @@ class App:
         elif key == ord("s"):
             self.mode = MODE_SEASON
             self.input_buffer = ""
-        elif key in (ord("b"), ord("B")):
-            # self.open_in_browser() # Uncomment if you implement this
-            return
 
     def handle_key_episodes(self, key):
-        if key in (ord("p"), ord("P")):
-            self.play_stream()
+        provider_idx = self._get_provider_idx_by_key(key)
+        if provider_idx is not None:
+            self.play_stream(start_provider_idx=provider_idx)
+            return
+        elif key in (ord("p"), ord("P")):
+            self.play_stream(start_provider_idx=None)
             return
         elif key == ord("e"):
             self.mode = MODE_EPISODE
@@ -796,22 +1453,26 @@ class App:
                 self.episode_selected = max(self.episode_selected - 1, 0)
         elif key in (curses.KEY_ENTER, 10, 13):
             self.open_episode_by_index(self.episode_selected)
-        elif key == 27:  # Esc
+        elif key == 27:
             self.screen = SCREEN_DETAIL
             self.error = None
             self.status = "Back to show details."
 
     def handle_key_episode_detail(self, key):
-        if key in (ord("p"), ord("P")):
-            self.play_stream()
+        provider_idx = self._get_provider_idx_by_key(key)
+        if provider_idx is not None:
+            self.play_stream(start_provider_idx=provider_idx)
             return
-        elif key == 27:  # Esc
+        elif key in (ord("p"), ord("P")):
+            self.play_stream(start_provider_idx=None)
+            return
+        elif key == 27:
             self.screen = SCREEN_EPISODES
             self.error = None
             self.status = "Back to episode list."
 
     def handle_text_input(self, key):
-        if key == 27:  # Esc cancels typing
+        if key == 27:
             self.mode = MODE_NORMAL
             self.input_buffer = ""
             return
@@ -846,7 +1507,6 @@ class App:
         if 32 <= key <= 126:
             self.input_buffer += chr(key)
 
-    # ---------- main loop ----------
     def run(self):
         self.draw()
         while True:
@@ -863,5 +1523,10 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        filename="tmdb_tui.log",
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     locale.setlocale(locale.LC_ALL, "")
     curses.wrapper(main)
