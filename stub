@@ -785,9 +785,9 @@ def _fetch_peestream(
 # =============================================================================
 
 PROVIDERS = [
-    StreamProvider(name="PROVIDER 1", key="1", fetch_func=_fetch_fourkhdhub),
-    StreamProvider(name="PROVIDER 2", key="2", fetch_func=_fetch_dramachi),
-    StreamProvider(name="PROVIDER 3", key="3", fetch_func= _fetch_peestream),
+    StreamProvider(name="4k", key="1", fetch_func=_fetch_fourkhdhub),
+    StreamProvider(name="Fastest", key="2", fetch_func= _fetch_peestream),
+    StreamProvider(name="Backup", key="3", fetch_func=_fetch_dramachi),
 ]
 
 
