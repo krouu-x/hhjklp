@@ -34,9 +34,7 @@ log = logging.getLogger("tmdb_tui")
 # ---------------------------------------------------------------------------
 
 TMDB_API_TOKEN = os.environ.get(
-    "TMDB_API_TOKEN",
-    "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1YjFjM2M4ZDg3MTU1MWU2NDg0N2FlNGQ5NTRlMDgwNyIsIm5iZiI6MTc4NjU2MTM5Ni43OTMsInN1YiI6IjZhN2NjMzc0ZmI3YTFjMjkwMTQ0ZmRlYSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.heOiSMRVHPZiCerBZK-91bqtqclEDjCbnzbYpFQo56w",
-)
+    "TMDB_API_TOKEN", "")
 TMDB_BASE_URL = os.environ.get("TMDB_BASE_URL", "https://api.themoviedb.org/3")
 
 HEADERS = {
