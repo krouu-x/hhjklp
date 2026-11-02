@@ -78,8 +78,6 @@ set TMDB_API_TOKEN=eyJhbGciOiJIUzI1NiJ9....
 $env:TMDB_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9...."
 ```
 
-> The script includes a default token for convenience — **please use your own** to avoid rate limits and respect the API terms.
-
 ---
 
 ## ⌨️ Controls
